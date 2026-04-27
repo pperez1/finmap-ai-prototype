@@ -1,0 +1,3 @@
+{"event": "auto_mapped", "column": "ReportDate", "mapping": "the_date_associated_with_the_financial_report_or_period", "confidence": 0.95, "timestamp": "2026-04-26T08:54:47.806965"}
+{"event": "auto_mapped", "column": "NetIncome", "mapping": "bottom-line_profit_after_all_expenses,_taxes,_and_costs_are_deducted_from_revenue", "confidence": 0.9, "timestamp": "2026-04-26T08:54:47.807438"}
+{"event": "mapping_run", "columns": ["ReportDate", "Revenue", "OperatingCost", "FixedOpex", "VariableOpex", "DSCR", "NetIncome"], "mapped": ["Revenue", "OperatingCost", "DSCR", "ReportDate", "NetIncome"], "unmapped": ["FixedOpex", "VariableOpex"], "timestamp": "2026-04-26T08:54:47.807517"}

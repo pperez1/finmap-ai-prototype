@@ -7,23 +7,31 @@ import json
 import re
 from dotenv import load_dotenv
 from anthropic import Anthropic
+from datetime import datetime
 
 # -----------------------------
-# LOAD ENV VARIABLES
+# CONFIG
+# -----------------------------
+AUTO_MAP_THRESHOLD = 0.9  # Phase 3 guardrail
+
+MEMORY_FILE = "schema_memory.json"
+LOG_FILE = "events.log"
+
+# -----------------------------
+# LOAD ENV
 # -----------------------------
 load_dotenv()
-
 API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 if not API_KEY:
-    raise ValueError("Missing ANTHROPIC_API_KEY in .env file")
+    raise ValueError("Missing ANTHROPIC_API_KEY")
 
 client = Anthropic(api_key=API_KEY)
 
 # -----------------------------
-# FASTAPI SETUP
+# FASTAPI
 # -----------------------------
-app = FastAPI(title="FinMap AI + Claude Schema Assistant")
+app = FastAPI(title="FinMap AI - Guardrailed Schema Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,7 +42,7 @@ app.add_middleware(
 )
 
 # -----------------------------
-# KNOWN SCHEMA ONLY
+# BASE SCHEMA
 # -----------------------------
 KNOWN_SCHEMA = {
     "Revenue": "revenue",
@@ -42,45 +50,42 @@ KNOWN_SCHEMA = {
     "DSCR": "dscr"
 }
 
-# -----------------------------
-# MAP KNOWN COLUMNS
-# -----------------------------
-def map_known(columns):
-    mapped = {}
-    unmapped = []
-
-    for col in columns:
-        if col in KNOWN_SCHEMA:
-            mapped[col] = {
-                "mapping": KNOWN_SCHEMA[col],
-                "confidence": 1.0,
-                "source": "deterministic"
-            }
-        else:
-            unmapped.append(col)
-
-    return mapped, unmapped
+PROTECTED_FIELDS = set(KNOWN_SCHEMA.values())
 
 # -----------------------------
-# JSON EXTRACTION (FIX)
+# MEMORY
+# -----------------------------
+def load_memory():
+    if not os.path.exists(MEMORY_FILE):
+        return {}
+    with open(MEMORY_FILE, "r") as f:
+        return json.load(f)
+
+def save_memory(memory):
+    with open(MEMORY_FILE, "w") as f:
+        json.dump(memory, f, indent=2)
+
+# -----------------------------
+# LOGGING
+# -----------------------------
+def log_event(event):
+    event["timestamp"] = datetime.utcnow().isoformat()
+    with open(LOG_FILE, "a") as f:
+        f.write(json.dumps(event) + "\n")
+
+# -----------------------------
+# JSON CLEANER
 # -----------------------------
 def extract_json(text):
-    """
-    Extract JSON from Claude response.
-    Handles markdown-wrapped JSON and messy outputs.
-    """
-    # Case 1: ```json ... ```
     match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
     if match:
         return match.group(1)
 
-    # Case 2: any {...}
     match = re.search(r"(\{.*\})", text, re.DOTALL)
     if match:
         return match.group(1)
 
     return text
-
 
 # -----------------------------
 # CLAUDE ANALYSIS
@@ -89,17 +94,15 @@ def analyze_with_claude(columns):
     if not columns:
         return {}
 
-    # Cleaner formatting for LLM
-    columns_str = "\n".join(f"- {col}" for col in columns)
+    columns_str = "\n".join(f"- {c}" for c in columns)
 
     prompt = f"""
 You are analyzing UNKNOWN column names from a financial dataset.
 
 Rules:
 - Do NOT assume they map to known schema
-- Do NOT force equivalence (e.g., revenue != income unless obvious)
+- Do NOT force equivalence (e.g., revenue != income)
 - Provide cautious interpretations
-- If unsure, say so
 
 For each column return:
 - possible_meaning
@@ -110,17 +113,6 @@ Columns:
 {columns_str}
 
 Return ONLY raw JSON.
-Do NOT wrap in markdown.
-Do NOT include backticks.
-
-Format:
-{{
-  "ColumnName": {{
-    "possible_meaning": "...",
-    "confidence": 0.0,
-    "reasoning": "..."
-  }}
-}}
 """
 
     response = client.messages.create(
@@ -130,41 +122,93 @@ Format:
         messages=[{"role": "user", "content": prompt}]
     )
 
-    raw_text = response.content[0].text
+    raw = response.content[0].text
 
     try:
-        cleaned = extract_json(raw_text)
+        cleaned = extract_json(raw)
         return json.loads(cleaned)
-    except Exception as e:
-        return {
-            "error": "Claude response parsing failed",
-            "details": str(e),
-            "raw": raw_text
-        }
-
+    except:
+        return {"error": "parse_failed", "raw": raw}
 
 # -----------------------------
 # AGENT PIPELINE
 # -----------------------------
 def agent(columns):
-    mapped, unmapped = map_known(columns)
+    memory = load_memory()
 
-    claude_analysis = analyze_with_claude(unmapped)
+    mapped = {}
+    unmapped = []
+    ai_suggestions = {}
+
+    # 1. Known + Learned mapping
+    for col in columns:
+        if col in KNOWN_SCHEMA:
+            mapped[col] = {
+                "mapping": KNOWN_SCHEMA[col],
+                "confidence": 1.0,
+                "source": "base_schema"
+            }
+
+        elif col in memory:
+            mapped[col] = {
+                "mapping": memory[col],
+                "confidence": 1.0,
+                "source": "learned"
+            }
+
+        else:
+            unmapped.append(col)
+
+    # 2. AI interpretation
+    ai_analysis = analyze_with_claude(unmapped)
+
+    # 3. Apply guardrails (auto-map if high confidence)
+    for col, data in ai_analysis.items():
+        confidence = data.get("confidence", 0)
+
+        if confidence >= AUTO_MAP_THRESHOLD:
+            proposed = data.get("possible_meaning", "unknown").lower().replace(" ", "_")
+
+            # Guardrail: do not overwrite protected schema
+            if proposed not in PROTECTED_FIELDS:
+                mapped[col] = {
+                    "mapping": proposed,
+                    "confidence": confidence,
+                    "source": "ai_auto"
+                }
+
+                log_event({
+                    "event": "auto_mapped",
+                    "column": col,
+                    "mapping": proposed,
+                    "confidence": confidence
+                })
+            else:
+                ai_suggestions[col] = data
+
+        else:
+            ai_suggestions[col] = data
+
+    # 4. Log run
+    log_event({
+        "event": "mapping_run",
+        "columns": columns,
+        "mapped": list(mapped.keys()),
+        "unmapped": list(ai_suggestions.keys())
+    })
 
     return {
         "mapped_columns": mapped,
-        "unmapped_columns": unmapped,
-        "claude_analysis": claude_analysis
+        "unmapped_columns": list(ai_suggestions.keys()),
+        "ai_suggestions": ai_suggestions
     }
-
 
 # -----------------------------
 # API ROUTES
 # -----------------------------
 @app.get("/")
 def root():
-    return {"message": "FinMap AI + Claude Schema Assistant Running"}
-
+    return {"message": "FinMap AI Running with Guardrails"}
 
 @app.post("/upload-excel")
 async def upload_excel(file: UploadFile = File(...)):
@@ -177,3 +221,23 @@ async def upload_excel(file: UploadFile = File(...)):
         "columns_detected": list(df.columns),
         "result": result
     }
+
+# -----------------------------
+# USER CONFIRMATION
+# -----------------------------
+@app.post("/confirm-mapping")
+def confirm_mapping(mapping: dict):
+    memory = load_memory()
+
+    for col, mapped_value in mapping.items():
+        memory[col] = mapped_value
+
+        log_event({
+            "event": "mapping_confirmed",
+            "column": col,
+            "mapped_to": mapped_value
+        })
+
+    save_memory(memory)
+
+    return {"status": "saved", "memory": memory}
